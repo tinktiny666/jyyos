@@ -1,105 +1,91 @@
 #include "co.h"
-#include <setjmp.h>
-#include <stdint-gcc.h>
+#include "linkedList.h"
+#include <time.h>
 #include <stdlib.h>
+#include <string.h>
+#include <assert.h>
+#include <setjmp.h>
+#include <stdlib.h>
+#include <stdio.h>
 
-#define STACK_SIZE 32768
-/*
-void entry(void *arg) {
-  while (n--) {
-    printf("%s", (const char *)arg);
-    co_yield();
-  }
-}
+threadNode *head, *tail, *currentThread;
+int idCount = 0;	// initial coroutinu number
 
-int main() {
-  struct co *co1 = co_start("co1", entry, "a");
-  struct co *co2 = co_start("co2", entry, "b");
-  co_wait(co1); // never returns
-  co_wait(co2);
-}
-*/
-
-
-static inline void stack_switch_call(void *sp, void *entry, uintptr_t arg)
+void initCoroutine()
 {
-    asm volatile(
+	currentThread = tail = head = init();
+}
+
+// sp->$rsp; arg->%rdi; jmp *entry;
+static inline void stack_switch_call(void *sp, void *entry, void *arg) {
+  asm volatile (
 #if __x86_64__
-        "movq %0, %%rsp; movq %2, %%rdi; jmp *%1"
-        :
-        : "b"((uintptr_t)sp), "d"(entry), "a"(arg)
-        : "memory"
+    "movq %0, %%rsp; movq %2, %%rdi; jmp *%1"
+      : : "b"((unsigned char*)sp), "d"(entry), "a"(arg) : "memory"
 #else
-        "movl %0, %%esp; movl %2, 4(%0); jmp *%1"
-        :
-        : "b"((uintptr_t)sp + 8), "d"(entry), "a"(arg)
-        : "memory"
+    "movl %0, %%esp; movl %2, 4(%0); jmp *%1"
+      : : "b"((unsigned char*)sp - 8), "d"(entry), "a"(arg) : "memory"
 #endif
-    );
+  );
 }
 
+co *co_start(const char *name, void (*func)(void *), void *arg) {
+	// initialize a co struct of coroutine
+	co *thread = malloc(sizeof(co));
+	thread->name = name;
+	thread->func = func;
+	thread->arg = arg;
+	thread->cid = ++idCount;	
+	thread->status = CO_NEW;
+	thread->waiter = NULL;
+	thread->env = (jmp_buf*)malloc(sizeof(jmp_buf));
+	threadNode * localThread = (threadNode*)malloc(sizeof(threadNode));
+	localThread->thread = thread;
+	tail = insertTail(tail, localThread);
 
-enum co_status {
-    CO_NEW = 1, // 新创建，还未执行过
-    CO_RUNNING, // 已经执行过
-    CO_WAITING, // 在 co_wait 上等待
-    CO_DEAD,    // 已经结束，但还未释放资源
-};
-
-struct co {
-    char *name;
-    void (*func)(void *); // co_start 指定的入口地址和参数
-    void *arg;
-
-    enum co_status status;     // 协程的状态
-    struct co *waiter;         // 是否有其他协程在等待当前协程
-    jmp_buf context;           // 寄存器现场 (setjmp.h)
-    uint8_t stack[STACK_SIZE]; // 协程的堆栈 uint8_t为一个字节
-};
-
-struct co *current; //当前运行线程
-
-struct co *co_start(const char *name, void (*func)(void *), void *arg)
-{
-    struct co* co_new=(struct co*)malloc(sizeof(struct co));
-    memset(co_new->stack,0,STACK_SIZE);
-    co_new->arg=arg;
-    co_new->func=func;
-    co_new->name=name;
-    co_new->status=CO_NEW;
-    co_new->waiter=NULL;
-    return co_new;
+	return thread; 
 }
 
-void co_wait(struct co *co)
-{
-    if(co->status == CO_NEW)
-        {
-          co->status=CO_RUNNING;
-          current=co;
-          stack_switch_call(co->stack,co->func,co->arg);
-        }
-    while (1) {
-        if (co->status == CO_DEAD) {
-            break;
-        }
-    }
-    return;
+void co_wait(co *co) {
+
+	currentThread->thread->status = CO_WAITTING;	// 
+	while(co->status != CO_DEAD) {
+		co_yield();
+	}
+	assert(co->status == CO_DEAD);
+	// release resource
+	free(co);	
 }
 
-void co_yield ()
+// Search the next thread to run if the thread's status is CO_NEW
+co *searchNextNewThread() //寻找下一个可以运行的协程
 {
-    int val = setjmp(current->context);
-    if (val == 0) {
-        // ?
-        if(!current->waiter){
-          longjmp(current->context,0);
-        }
-        current->status=CO_WAITING;
-        current=current->waiter;
-        longjmp(current->context,0);
-    } else
-    {
-      current->status=CO_RUNNING;
-    }
+	threadNode *nextThread = head;
+	srand(time(NULL));
+	int randomThreadIndex = rand() % idCount + 1;
+	while(randomThreadIndex--) 
+		nextThread = nextThread->next;	
+	
+	return nextThread->thread; 
+}
+
+void co_yield() {
+	int val = setjmp(currentThread->thread->env);
+	co* m_co=currentThread->thread;
+	if(val == 0) {
+		// which indicats it was called by setjmp directly
+		currentThread->thread->status=CO_WAITTING;
+		co *cur = searchNextNewThread();		 
+		if(cur->status == CO_NEW) {
+			cur->status = CO_RUNNING;
+			stack_switch_call(cur->stack, cur->func, cur->arg);			
+		} else if(cur->status == CO_RUNNING) {
+			longjmp(*(cur->env), cur->cid);
+		}else if(cur->status==CO_WAITTING)
+		{
+			cur->status=CO_RUNNING;
+			longjmp(*(cur->env), cur->cid);
+		}
+		m_co->status = CO_DEAD;	// 
+	}
 }
